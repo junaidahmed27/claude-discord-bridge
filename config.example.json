@@ -1,0 +1,29 @@
+{
+  "_comment_token": "Bot token from https://discord.com/developers/applications → your app → Bot. Treat as a secret.",
+  "bot_token": "PASTE_YOUR_BOT_TOKEN_HERE",
+
+  "_comment_channels": "Discord channel IDs where the bot accepts triggers. Right-click a channel in Discord (with Developer Mode on) → 'Copy Channel ID'.",
+  "allowed_channel_ids": [
+    "123456789012345678"
+  ],
+
+  "_comment_users": "Discord user IDs allowed to trigger sessions. Right-click your username → 'Copy User ID'. ANY user not in this list is ignored.",
+  "allowed_user_ids": [
+    "987654321098765432"
+  ],
+
+  "_comment_workdir": "Directory `claude -p` runs in. Make it whatever project you want to drive from Discord, e.g. /Users/junaidahmed/tradingagents.",
+  "working_directory": "/Users/junaidahmed",
+
+  "_comment_claude": "Absolute path to the claude binary. `which claude` if unsure.",
+  "claude_path": "/opt/homebrew/bin/claude",
+
+  "_comment_timeout": "Hard timeout (seconds) for a single claude invocation. 0 = no timeout. Default 1800 = 30 min.",
+  "session_timeout_s": 1800,
+
+  "_comment_concurrency": "How many concurrent sessions are allowed across all users. 1 is safest on a workstation.",
+  "max_concurrent_sessions": 1,
+
+  "_comment_prefix": "Optional command prefix. When set, only messages starting with this prefix trigger a session. Empty string = every message triggers.",
+  "trigger_prefix": "!claude "
+}

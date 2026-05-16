@@ -1,0 +1,8 @@
+config.json
+.venv/
+__pycache__/
+*.pyc
+history.db
+history.db-journal
+history.db-wal
+history.db-shm
