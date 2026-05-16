@@ -1,27 +1,32 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!--
+    LaunchAgent template. install.sh substitutes __HOME__ → $HOME before
+    writing the rendered file to ~/Library/LaunchAgents/.
+    Do not load this template file directly with launchctl.
+-->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.junaidahmed.claude-discord</string>
+    <string>local.claude-discord-bridge</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/junaidahmed/.claude-discord/.venv/bin/python</string>
-        <string>/Users/junaidahmed/.claude-discord/listener.py</string>
+        <string>__HOME__/.claude-discord/.venv/bin/python</string>
+        <string>__HOME__/.claude-discord/listener.py</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/junaidahmed/.claude-discord</string>
+    <string>__HOME__/.claude-discord</string>
 
-    <!-- macOS LaunchAgents are stripped down. Inject the bits the listener needs
-         (claude binary lives in /opt/homebrew/bin on Apple Silicon). -->
+    <!-- macOS LaunchAgents inherit a minimal environment. /usr/sbin is
+         required because lsof lives there. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
-        <string>/Users/junaidahmed</string>
+        <string>__HOME__</string>
     </dict>
 
     <key>RunAtLoad</key>
@@ -38,11 +43,10 @@
     <integer>30</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/junaidahmed/Library/Logs/claude-discord/listener.out.log</string>
+    <string>__HOME__/Library/Logs/claude-discord/listener.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/junaidahmed/Library/Logs/claude-discord/listener.err.log</string>
+    <string>__HOME__/Library/Logs/claude-discord/listener.err.log</string>
 
-    <!-- Limit resources so a runaway claude session doesn't OOM the machine. -->
     <key>SoftResourceLimits</key>
     <dict>
         <key>NumberOfFiles</key>

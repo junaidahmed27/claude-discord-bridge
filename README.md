@@ -20,7 +20,7 @@ Mac → output is posted back in the same channel.
 ├── config.example.json   ← copy → config.json, fill in
 ├── listener.py           ← the bot
 ├── requirements.txt      ← discord.py
-├── com.junaidahmed.claude-discord.plist  ← LaunchAgent
+├── com.claude-discord-bridge.plist.template  ← LaunchAgent template (install.sh substitutes $HOME)
 ├── install.sh            ← venv + LaunchAgent installer
 ├── uninstall.sh
 └── README.md             ← this file
@@ -119,9 +119,9 @@ The bot will:
 | Want to... | Command |
 |---|---|
 | Tail logs | `tail -f ~/Library/Logs/claude-discord/listener.{out,err}.log` |
-| Stop the listener | `launchctl bootout gui/$(id -u)/com.junaidahmed.claude-discord` |
-| Start it | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.junaidahmed.claude-discord.plist` |
-| Restart after editing config | `launchctl kickstart -k gui/$(id -u)/com.junaidahmed.claude-discord` |
+| Stop the listener | `launchctl bootout gui/$(id -u)/local.claude-discord-bridge` |
+| Start it | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.claude-discord-bridge.plist` |
+| Restart after editing config | `launchctl kickstart -k gui/$(id -u)/local.claude-discord-bridge` |
 | Change which project `claude` runs in | Edit `working_directory` in `config.json` → restart |
 | Add another channel | Append to `allowed_channel_ids` → restart |
 | Uninstall | `./uninstall.sh` |

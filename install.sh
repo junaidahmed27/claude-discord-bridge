@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Sets up the venv, installs the LaunchAgent, and starts the listener.
-# Re-run any time you change the plist or update dependencies.
+# Sets up the venv, renders the LaunchAgent plist for the current user, and
+# starts the listener. Re-run any time you change the template or update deps.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLIST_NAME="com.junaidahmed.claude-discord.plist"
+TEMPLATE="$HERE/com.claude-discord-bridge.plist.template"
+LABEL="local.claude-discord-bridge"
 USER_LAUNCH_DIR="$HOME/Library/LaunchAgents"
+PLIST_NAME="$LABEL.plist"
+PLIST_OUT="$USER_LAUNCH_DIR/$PLIST_NAME"
 LOG_DIR="$HOME/Library/Logs/claude-discord"
 
 echo "==> Verifying config.json exists"
@@ -28,22 +31,33 @@ echo "==> Installing dependencies"
 echo "==> Creating log directory"
 mkdir -p "$LOG_DIR"
 
-echo "==> Installing LaunchAgent"
+echo "==> Rendering plist for HOME=$HOME"
 mkdir -p "$USER_LAUNCH_DIR"
-cp "$HERE/$PLIST_NAME" "$USER_LAUNCH_DIR/$PLIST_NAME"
+# Substitute __HOME__ with the runtime value; sed is fine because $HOME is a
+# real path with no characters that need escaping in our usage.
+sed "s|__HOME__|$HOME|g" "$TEMPLATE" > "$PLIST_OUT"
 
-# Unload if already loaded, ignoring errors, then load fresh.
-launchctl bootout "gui/$(id -u)/com.junaidahmed.claude-discord" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$USER_LAUNCH_DIR/$PLIST_NAME"
-launchctl enable "gui/$(id -u)/com.junaidahmed.claude-discord"
-launchctl kickstart -k "gui/$(id -u)/com.junaidahmed.claude-discord"
+# Clean up the older personalized service if upgrading from an earlier install.
+OLD_LABEL="com.junaidahmed.claude-discord"
+OLD_PLIST="$USER_LAUNCH_DIR/$OLD_LABEL.plist"
+if [[ -f "$OLD_PLIST" ]]; then
+    echo "==> Removing legacy service $OLD_LABEL"
+    launchctl bootout "gui/$(id -u)/$OLD_LABEL" 2>/dev/null || true
+    rm -f "$OLD_PLIST"
+fi
+
+echo "==> Loading $LABEL"
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST_OUT"
+launchctl enable "gui/$(id -u)/$LABEL"
+launchctl kickstart -k "gui/$(id -u)/$LABEL"
 
 echo
 echo "==> Done. Useful commands:"
 echo
 echo "  Tail logs:        tail -f $LOG_DIR/listener.out.log $LOG_DIR/listener.err.log"
-echo "  Stop:             launchctl bootout gui/\$(id -u)/com.junaidahmed.claude-discord"
-echo "  Start:            launchctl bootstrap gui/\$(id -u) $USER_LAUNCH_DIR/$PLIST_NAME"
-echo "  Restart:          launchctl kickstart -k gui/\$(id -u)/com.junaidahmed.claude-discord"
+echo "  Stop:             launchctl bootout gui/\$(id -u)/$LABEL"
+echo "  Start:            launchctl bootstrap gui/\$(id -u) $PLIST_OUT"
+echo "  Restart:          launchctl kickstart -k gui/\$(id -u)/$LABEL"
 echo "  Uninstall:        bash $HERE/uninstall.sh"
 echo

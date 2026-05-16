@@ -6,3 +6,5 @@ history.db
 history.db-journal
 history.db-wal
 history.db-shm
+# Rendered plist (contains the local user's $HOME). The .template stays tracked.
+*.plist
