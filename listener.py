@@ -43,6 +43,31 @@ logging.basicConfig(
 logger = logging.getLogger("claude-discord")
 
 
+def _migrate_legacy_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Backwards-compat: old config had a single global trigger_prefix + claude_path.
+
+    Synthesize a `backends` + `channels` shape so the rest of the codebase only
+    has to understand one schema.
+    """
+    if "backends" in cfg and "channels" in cfg:
+        return cfg
+    binary = cfg.get("claude_path") or "/opt/homebrew/bin/claude"
+    workdir = cfg.get("working_directory") or str(Path.home())
+    prefix = cfg.get("trigger_prefix", "!claude ")
+    cfg["backends"] = {
+        "claude": {
+            "binary": binary,
+            "trigger_prefix": prefix,
+            "working_directory": workdir,
+            "exec_args": ["-p"],
+            "resume_args": ["-p", "--resume", "{session_id}"],
+            "session_kind": "claude",
+        }
+    }
+    cfg["channels"] = {str(cid): "claude" for cid in cfg.get("allowed_channel_ids", [])}
+    return cfg
+
+
 def load_config() -> Dict[str, Any]:
     if not CONFIG_PATH.exists():
         logger.error("Config not found at %s. Copy config.example.json → config.json and fill it in.", CONFIG_PATH)
@@ -51,22 +76,47 @@ def load_config() -> Dict[str, Any]:
         raw = json.load(f)
     # Strip the _comment_* documentation keys.
     cfg = {k: v for k, v in raw.items() if not k.startswith("_comment_")}
-    required = ("bot_token", "allowed_channel_ids", "allowed_user_ids", "working_directory", "claude_path")
-    missing = [k for k in required if not cfg.get(k)]
-    if missing:
-        logger.error("Missing required config keys: %s", ", ".join(missing))
+    cfg = _migrate_legacy_config(cfg)
+
+    if not cfg.get("bot_token"):
+        logger.error("Missing required config key: bot_token")
         sys.exit(2)
-    # Normalize ID lists to sets of strings — Discord IDs are 64-bit ints but
-    # round-tripping through JSON loses precision unless treated as strings.
-    cfg["allowed_channel_ids"] = {str(x) for x in cfg["allowed_channel_ids"]}
+    if not cfg.get("allowed_user_ids"):
+        logger.error("Missing required config key: allowed_user_ids")
+        sys.exit(2)
+    if not cfg.get("channels"):
+        logger.error("Missing required config key: channels (channel_id → backend_name mapping)")
+        sys.exit(2)
+    if not cfg.get("backends"):
+        logger.error("Missing required config key: backends")
+        sys.exit(2)
+
     cfg["allowed_user_ids"] = {str(x) for x in cfg["allowed_user_ids"]}
+    cfg["channels"] = {str(cid): name for cid, name in cfg["channels"].items()}
+    # Set of allowed channel IDs for cheap lookup.
+    cfg["allowed_channel_ids"] = set(cfg["channels"].keys())
     cfg.setdefault("session_timeout_s", 1800)
     cfg.setdefault("max_concurrent_sessions", 1)
-    cfg.setdefault("trigger_prefix", "")
-    if not Path(cfg["claude_path"]).is_file():
-        logger.warning("claude binary not found at %s — invocations will fail.", cfg["claude_path"])
-    if not Path(cfg["working_directory"]).is_dir():
-        logger.warning("working_directory %s does not exist — claude will refuse to run.", cfg["working_directory"])
+
+    for name, b in cfg["backends"].items():
+        b.setdefault("exec_args", [])
+        b.setdefault("resume_args", [])
+        b.setdefault("session_kind", name)  # used by transcripts.py to pick a parser
+        b.setdefault("trigger_prefix", f"!{name} ")
+        b.setdefault("working_directory", str(Path.home()))
+        if "binary" not in b:
+            logger.error("Backend %s is missing 'binary'", name)
+            sys.exit(2)
+        if not Path(b["binary"]).is_file():
+            logger.warning("Backend %s: binary not found at %s — invocations will fail.", name, b["binary"])
+        if not Path(b["working_directory"]).is_dir():
+            logger.warning("Backend %s: working_directory %s does not exist.", name, b["working_directory"])
+
+    # Validate every channel maps to a known backend.
+    for cid, backend_name in cfg["channels"].items():
+        if backend_name not in cfg["backends"]:
+            logger.error("Channel %s maps to unknown backend %r", cid, backend_name)
+            sys.exit(2)
     return cfg
 
 
@@ -111,6 +161,11 @@ def db_init() -> None:
             )
             """
         )
+        # Additive migration: pre-existing DBs lack the `backend` column.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(history)").fetchall()}
+        if "backend" not in cols:
+            conn.execute("ALTER TABLE history ADD COLUMN backend TEXT")
+            conn.execute("UPDATE history SET backend = 'claude' WHERE backend IS NULL")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_history_finished ON history(finished_at DESC)"
         )
@@ -125,11 +180,12 @@ def db_insert_sync(entry: Dict[str, Any]) -> None:
         conn.execute(
             """
             INSERT OR REPLACE INTO history
-                (job_id, author, preview, returncode, elapsed, started_at, finished_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (job_id, backend, author, preview, returncode, elapsed, started_at, finished_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry["job_id"],
+                entry.get("backend", "claude"),
                 entry["author"],
                 entry["preview"],
                 entry["returncode"],
@@ -148,7 +204,8 @@ def db_recent_sync(n: int) -> List[Dict[str, Any]]:
     try:
         cur = conn.execute(
             """
-            SELECT job_id, author, preview, returncode, elapsed, started_at, finished_at
+            SELECT job_id, COALESCE(backend, 'claude') AS backend,
+                   author, preview, returncode, elapsed, started_at, finished_at
             FROM history
             ORDER BY finished_at DESC
             LIMIT ?
@@ -172,10 +229,14 @@ def db_count_sync() -> int:
 db_init()
 
 
+def backend_for_channel(channel_id: int | str) -> Optional[str]:
+    return CONFIG["channels"].get(str(channel_id))
+
+
 def is_allowed(message: discord.Message) -> bool:
     if message.author.bot:
         return False
-    if str(message.channel.id) not in CONFIG["allowed_channel_ids"]:
+    if backend_for_channel(message.channel.id) is None:
         return False
     if str(message.author.id) not in CONFIG["allowed_user_ids"]:
         logger.warning("Unallowlisted user %s (%s) tried to trigger.", message.author, message.author.id)
@@ -183,9 +244,9 @@ def is_allowed(message: discord.Message) -> bool:
     return True
 
 
-def extract_prompt(message: discord.Message) -> str | None:
+def extract_prompt(message: discord.Message, backend_name: str) -> Optional[str]:
     text = (message.content or "").strip()
-    prefix = CONFIG["trigger_prefix"]
+    prefix = CONFIG["backends"][backend_name].get("trigger_prefix", "")
     if prefix:
         if not text.startswith(prefix):
             return None
@@ -193,33 +254,38 @@ def extract_prompt(message: discord.Message) -> str | None:
     return text or None
 
 
-async def run_claude(
+async def run_backend(
+    backend_name: str,
     prompt: str,
     job_id: str,
     *,
     resume_id: Optional[str] = None,
     cwd_override: Optional[str] = None,
 ) -> tuple[int, str, str]:
-    """Run `claude -p "<prompt>"` as a subprocess. Returns (returncode, stdout, stderr).
+    """Run a backend CLI as a subprocess and return (returncode, stdout, stderr).
 
-    When resume_id is provided, the invocation becomes
-        claude -p --resume <resume_id> "<prompt>"
-    and cwd is set to cwd_override so the resume can find the session file under
-    ~/.claude/projects/<encoded-cwd>/<id>.jsonl.
+    Command is built from the backend's exec_args / resume_args templates plus
+    the prompt as the trailing positional argument. resume_args may contain a
+    "{session_id}" token that gets substituted with the actual session UUID.
     """
-    cmd = [CONFIG["claude_path"], "-p"]
+    backend = CONFIG["backends"][backend_name]
+    binary = backend["binary"]
     if resume_id:
-        cmd += ["--resume", resume_id]
-    cmd.append(prompt)
-    cwd = cwd_override or CONFIG["working_directory"]
+        template = backend.get("resume_args") or backend["exec_args"]
+        templated = [t.replace("{session_id}", resume_id) for t in template]
+    else:
+        templated = list(backend["exec_args"])
+    cmd = [binary, *templated, prompt]
+    cwd = cwd_override or backend["working_directory"]
     env = os.environ.copy()
-    # Force a stable working dir and unbuffered output so we get progressive lines.
     env["PYTHONUNBUFFERED"] = "1"
 
     logger.info(
-        "[%s] spawn: %s%s (cwd=%s)",
-        job_id, " ".join(cmd[:2]),
-        f" --resume {resume_id[:8]}" if resume_id else "",
+        "[%s] spawn: %s %s%s (cwd=%s)",
+        job_id,
+        Path(binary).name,
+        " ".join(templated),
+        f" (resume {resume_id[:8]})" if resume_id else "",
         cwd,
     )
     proc = await asyncio.create_subprocess_exec(
@@ -400,7 +466,7 @@ def find_workstation_claude_sessions(exclude_pids: Set[int]) -> List[Dict[str, A
             continue
         if pid in exclude_pids:
             continue
-        if ucomm not in ("claude", "claude.exe"):
+        if ucomm not in ("claude", "claude.exe", "codex"):
             continue
         if not tty or not tty.startswith("ttys"):
             continue
@@ -441,6 +507,7 @@ def find_workstation_claude_sessions(exclude_pids: Set[int]) -> List[Dict[str, A
             "cpu_pct": cpu_pct,
             "cwd": cwd,
             "command": command,
+            "kind": "codex" if ucomm == "codex" else "claude",
             "status": status,
             "activity_age_s": activity_age,
         })
@@ -501,7 +568,7 @@ async def handle_status(message: discord.Message) -> None:
             else:
                 activity = f"{int(age // 86400)}d ago"
             other_lines.append(
-                f"  {status_icon[o['status']]} PID `{o['pid']}` · tty `{o['tty']}` · "
+                f"  {status_icon[o['status']]} `{o['kind']}` PID `{o['pid']}` · tty `{o['tty']}` · "
                 f"CPU `{o['cpu_pct']:.1f}%` · last activity `{activity}` · cwd `{cwd}`"
             )
         parts.append(
@@ -596,8 +663,9 @@ async def handle_history(message: discord.Message, arg: str) -> None:
             ago_s = f"{ago // 3600}h ago"
         else:
             ago_s = f"{ago // 86400}d ago"
+        backend = entry.get("backend") or "claude"
         lines.append(
-            f"{icon} `{entry['job_id']}` · {entry['elapsed']:.1f}s · {ago_s} · _{entry['author']}_ · `{entry['preview']}`"
+            f"{icon} `{entry['job_id']}` [{backend}] · {entry['elapsed']:.1f}s · {ago_s} · _{entry['author']}_ · `{entry['preview']}`"
         )
     body = (
         f"📜 Last **{len(rows)}** of {total} session(s) (newest first):\n"
@@ -608,8 +676,9 @@ async def handle_history(message: discord.Message, arg: str) -> None:
     await message.reply(body, mention_author=False)
 
 
-async def handle_sessions(message: discord.Message, arg: str) -> None:
-    """List Claude Code sessions stored on this workstation."""
+async def handle_sessions(message: discord.Message, backend_name: str, arg: str) -> None:
+    """List sessions stored on disk for the channel's backend."""
+    kind = CONFIG["backends"][backend_name].get("session_kind", backend_name)
     parts = arg.strip().split()
     limit = 10
     proj_filter: Optional[str] = None
@@ -618,16 +687,19 @@ async def handle_sessions(message: discord.Message, arg: str) -> None:
             limit = max(1, min(int(p), 30))
         else:
             proj_filter = p
-    sessions = await asyncio.to_thread(transcripts_mod.list_sessions, limit, proj_filter)
+    try:
+        sessions = await asyncio.to_thread(transcripts_mod.list_sessions, kind, limit, proj_filter)
+    except ValueError as e:
+        await message.reply(f"⚠️ {e}", mention_author=False)
+        return
     if not sessions:
-        await message.reply("📭 No sessions found.", mention_author=False)
+        await message.reply(f"📭 No {backend_name} sessions found.", mention_author=False)
         return
     now = time.time()
     lines: List[str] = []
+    prefix = CONFIG["backends"][backend_name].get("trigger_prefix", "")
     for s in sessions:
         ago = _format_elapsed(now - s.mtime)
-        # Show the most recent user prompt — what the session is currently about,
-        # not how it started.
         preview = (s.latest_user_prompt or s.first_user_prompt).replace("\n", " ")
         if len(preview) > 70:
             preview = preview[:70] + "…"
@@ -635,7 +707,7 @@ async def handle_sessions(message: discord.Message, arg: str) -> None:
             f"`{s.short_id}` · {s.project_label} · {s.message_count} msgs · {ago} ago · _{preview or '(no user prompt)'}_"
         )
     body = (
-        f"📚 **{len(sessions)}** session(s), newest activity first (use `{CONFIG['trigger_prefix']}transcript <id>` to fetch):\n"
+        f"📚 **{len(sessions)}** {backend_name} session(s), newest first (use `{prefix}transcript <id>`):\n"
         + "\n".join(lines)
     )
     if len(body) > DISCORD_MSG_LIMIT:
@@ -643,30 +715,32 @@ async def handle_sessions(message: discord.Message, arg: str) -> None:
     await message.reply(body, mention_author=False)
 
 
-async def handle_transcript(message: discord.Message, arg: str) -> None:
+async def handle_transcript(message: discord.Message, backend_name: str, arg: str) -> None:
     """Render one session as a markdown file and post it as an attachment."""
+    kind = CONFIG["backends"][backend_name].get("session_kind", backend_name)
+    trigger_prefix = CONFIG["backends"][backend_name].get("trigger_prefix", "")
     parts = arg.strip().split()
     if not parts:
         await message.reply(
-            f"Usage: `{CONFIG['trigger_prefix']}transcript <id_prefix> [thinking]`\n"
-            f"Run `{CONFIG['trigger_prefix']}sessions` to see IDs.",
+            f"Usage: `{trigger_prefix}transcript <id_prefix> [thinking]`\n"
+            f"Run `{trigger_prefix}sessions` to see IDs.",
             mention_author=False,
         )
         return
     prefix = parts[0]
     include_thinking = any(p.lower() in ("thinking", "+thinking", "full") for p in parts[1:])
 
-    info = await asyncio.to_thread(transcripts_mod.find_session, prefix)
+    info = await asyncio.to_thread(transcripts_mod.find_session, kind, prefix)
     if info is None:
         await message.reply(
-            f"❓ No session id starts with `{prefix}`, or the prefix matches more than one. "
-            f"Use a longer prefix or run `{CONFIG['trigger_prefix']}sessions`.",
+            f"❓ No {backend_name} session id starts with `{prefix}`, or the prefix matches more than one. "
+            f"Use a longer prefix or run `{trigger_prefix}sessions`.",
             mention_author=False,
         )
         return
 
     rendered = await asyncio.to_thread(
-        transcripts_mod.render_transcript, info, include_thinking=include_thinking
+        transcripts_mod.render_transcript, kind, info, include_thinking=include_thinking
     )
     # Header preview goes inline; full transcript becomes a file attachment.
     header = (
@@ -687,38 +761,41 @@ async def handle_transcript(message: discord.Message, arg: str) -> None:
 
 async def _execute_and_reply(
     message: discord.Message,
+    backend_name: str,
     prompt: str,
     *,
     resume_id: Optional[str] = None,
     cwd_override: Optional[str] = None,
     preview_override: Optional[str] = None,
 ) -> None:
-    """Acquire a slot, run claude (optionally resuming a session), post the reply.
+    """Acquire a slot, run the backend CLI, post the reply.
 
     Shared between fresh sessions (handle_message) and resumed ones
     (handle_resume) so the ack-edit pipeline + history-write logic doesn't drift.
     """
     job_id = uuid.uuid4().hex[:8]
     preview = preview_override or prompt[:200]
-    logger.info("[%s] %s: %r", job_id, message.author, preview)
+    logger.info("[%s] backend=%s %s: %r", job_id, backend_name, message.author, preview)
 
+    backend_label = backend_name
     label_extra = f" (resume {resume_id[:8]})" if resume_id else ""
     ack = await message.reply(
-        f"🤖 starting `{job_id}`{label_extra} — _waiting for a free slot..._",
+        f"🤖 `{backend_label}` starting `{job_id}`{label_extra} — _waiting for a free slot..._",
         mention_author=False,
     )
     started = time.time()
 
     async with SEMAPHORE:
-        await ack.edit(content=f"🤖 `{job_id}`{label_extra} running... (started <t:{int(started)}:R>)")
+        await ack.edit(content=f"🤖 `{backend_label}` `{job_id}`{label_extra} running... (started <t:{int(started)}:R>)")
         ACTIVE_JOBS[job_id] = (str(message.author), preview[:80], started)
         try:
-            returncode, stdout, stderr = await run_claude(
-                prompt, job_id, resume_id=resume_id, cwd_override=cwd_override,
+            returncode, stdout, stderr = await run_backend(
+                backend_name, prompt, job_id,
+                resume_id=resume_id, cwd_override=cwd_override,
             )
         except FileNotFoundError as e:
-            await ack.edit(content=f"❌ `{job_id}` failed: claude binary not found ({e}). Fix `claude_path` in config.")
-            logger.exception("[%s] claude binary missing", job_id)
+            await ack.edit(content=f"❌ `{job_id}` failed: {backend_label} binary not found ({e}). Fix `binary` in config.")
+            logger.exception("[%s] %s binary missing", job_id, backend_name)
             return
         except Exception as e:
             await ack.edit(content=f"❌ `{job_id}` errored: `{type(e).__name__}: {e}`")
@@ -730,13 +807,14 @@ async def _execute_and_reply(
     elapsed = time.time() - started
     finished_at = time.time()
     await ack.edit(
-        content=f"🤖 `{job_id}`{label_extra} finished in {elapsed:.1f}s — see reply below.",
+        content=f"🤖 `{backend_label}` `{job_id}`{label_extra} finished in {elapsed:.1f}s — see reply below.",
     )
     await reply_with_output(message.channel, job_id, preview, returncode, stdout, stderr)
     logger.info("[%s] done in %.1fs | rc=%d | stdout=%d chars", job_id, elapsed, returncode, len(stdout))
     try:
         await asyncio.to_thread(db_insert_sync, {
             "job_id": job_id,
+            "backend": backend_name,
             "author": str(message.author),
             "preview": preview[:80].replace("\n", " "),
             "returncode": returncode,
@@ -748,44 +826,50 @@ async def _execute_and_reply(
         logger.exception("[%s] failed to write history row", job_id)
 
 
-async def handle_resume(message: discord.Message, arg: str) -> None:
-    """Continue an existing Claude session with one follow-up turn.
+async def handle_resume(message: discord.Message, backend_name: str, arg: str) -> None:
+    """Continue an existing session for the channel's backend with one follow-up.
 
-    Form: <prefix>resume <id_prefix> <message>
-    Looks up the session, then runs `claude -p --resume <id> "<message>"` in
-    the session's original cwd so claude can find the on-disk transcript.
+    Looks up the session, then runs the backend's resume command in the session's
+    original cwd so the CLI can find the on-disk transcript.
     """
+    kind = CONFIG["backends"][backend_name].get("session_kind", backend_name)
+    trigger_prefix = CONFIG["backends"][backend_name].get("trigger_prefix", "")
     parts = arg.strip().split(None, 1)
     if len(parts) < 2:
         await message.reply(
-            f"Usage: `{CONFIG['trigger_prefix']}resume <id_prefix> <message>`\n"
-            f"Run `{CONFIG['trigger_prefix']}sessions` to find session IDs.",
+            f"Usage: `{trigger_prefix}resume <id_prefix> <message>`\n"
+            f"Run `{trigger_prefix}sessions` to find session IDs.",
             mention_author=False,
         )
         return
     prefix, followup = parts
-    info = await asyncio.to_thread(transcripts_mod.find_session, prefix)
+    info = await asyncio.to_thread(transcripts_mod.find_session, kind, prefix)
     if info is None:
         await message.reply(
-            f"❓ No session id starts with `{prefix}`, or the prefix matches more than one. "
-            f"Use a longer prefix or run `{CONFIG['trigger_prefix']}sessions`.",
+            f"❓ No {backend_name} session id starts with `{prefix}`, or the prefix matches more than one. "
+            f"Use a longer prefix or run `{trigger_prefix}sessions`.",
             mention_author=False,
         )
         return
+    cwd = info.project_dir if info.project_dir and info.project_dir != "(unknown)" else None
     await _execute_and_reply(
         message,
+        backend_name,
         followup,
         resume_id=info.session_id,
-        cwd_override=info.project_dir,
+        cwd_override=cwd,
         preview_override=f"[resume {info.short_id}] {followup}",
     )
 
 
 async def handle_message(message: discord.Message) -> None:
-    prompt = extract_prompt(message)
+    backend_name = backend_for_channel(message.channel.id)
+    if not backend_name:
+        return  # shouldn't happen because is_allowed gates this, but be defensive
+    prompt = extract_prompt(message, backend_name)
     if not prompt:
         return
-    # Reserved sub-commands run instead of spawning a Claude session.
+    # Reserved sub-commands run instead of spawning a fresh session.
     stripped = prompt.strip()
     head, _, tail = stripped.partition(" ")
     cmd = head.lower().lstrip("/")
@@ -799,29 +883,30 @@ async def handle_message(message: discord.Message) -> None:
         await handle_history(message, tail)
         return
     if cmd == "sessions":
-        await handle_sessions(message, tail)
+        await handle_sessions(message, backend_name, tail)
         return
     if cmd in ("transcript", "tx"):
-        await handle_transcript(message, tail)
+        await handle_transcript(message, backend_name, tail)
         return
     if cmd == "resume":
-        await handle_resume(message, tail)
+        await handle_resume(message, backend_name, tail)
         return
     if cmd == "help":
+        prefix = CONFIG["backends"][backend_name].get("trigger_prefix", "")
         await message.reply(
-            "**Commands** (with prefix `" + CONFIG["trigger_prefix"] + "`)\n"
-            "• `<prompt>` — run a fresh Claude Code session\n"
+            f"**Commands in this channel — backend `{backend_name}` — prefix `{prefix}`**\n"
+            "• `<prompt>` — run a fresh session\n"
             "• `resume <id_prefix> <message>` — continue an existing session with one follow-up\n"
-            "• `status` — bot-spawned + every workstation Claude session\n"
+            "• `status` — bot-spawned + every workstation CLI session\n"
             "• `cancel [job_id|all]` — kill one or all bot-spawned sessions\n"
-            "• `history [n]` — last N (default 10) bot jobs (persists in SQLite)\n"
-            "• `sessions [n] [project_filter]` — every Claude session on disk (default 10)\n"
+            "• `history [n]` — last N (default 10) bot jobs across all backends\n"
+            "• `sessions [n] [project_filter]` — every on-disk session for this backend\n"
             "• `transcript <id_prefix> [thinking]` — fetch one session as a markdown file\n"
             "• `help` — this message",
             mention_author=False,
         )
         return
-    await _execute_and_reply(message, prompt)
+    await _execute_and_reply(message, backend_name, prompt)
 
 
 def _set_intents() -> discord.Intents:
@@ -834,12 +919,13 @@ def _set_intents() -> discord.Intents:
 
 class ClaudeBot(discord.Client):
     async def on_ready(self) -> None:  # type: ignore[override]
+        channel_map = ", ".join(f"{cid}→{bn}" for cid, bn in sorted(CONFIG["channels"].items()))
+        backend_map = ", ".join(f"{bn}=`{cfg.get('binary','?')}`" for bn, cfg in CONFIG["backends"].items())
         logger.info(
-            "Connected as %s (id=%s). Allowed channels=%s users=%s. Prefix=%r.",
+            "Connected as %s (id=%s). Users=%s. Channels: %s. Backends: %s.",
             self.user, getattr(self.user, "id", "?"),
-            sorted(CONFIG["allowed_channel_ids"]),
             sorted(CONFIG["allowed_user_ids"]),
-            CONFIG["trigger_prefix"],
+            channel_map, backend_map,
         )
 
     async def on_message(self, message: discord.Message) -> None:  # type: ignore[override]
