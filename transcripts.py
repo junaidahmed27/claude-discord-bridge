@@ -37,6 +37,7 @@ class SessionInfo:
     size_bytes: int
     message_count: int = 0
     first_user_prompt: str = ""
+    latest_user_prompt: str = ""  # most recent user turn, useful for "what is this conversation currently about"
 
     @property
     def short_id(self) -> str:
@@ -92,16 +93,17 @@ def list_sessions(limit: int = 20, project_filter: Optional[str] = None) -> List
     candidates.sort(key=lambda s: s.mtime, reverse=True)
     head = candidates[:limit]
 
-    # Cheap preview: stream until we have a message count + first user prompt.
+    # Cheap preview: stream through and capture message count + first/last user prompt.
     for s in head:
-        s.message_count, s.first_user_prompt = _quick_summary(s.file)
+        s.message_count, s.first_user_prompt, s.latest_user_prompt = _quick_summary(s.file)
     return head
 
 
-def _quick_summary(path: Path) -> Tuple[int, str]:
-    """Count user/assistant events and grab the first user prompt as a preview."""
+def _quick_summary(path: Path) -> Tuple[int, str, str]:
+    """One forward pass over the .jsonl. Returns (msg_count, first_user, last_user)."""
     count = 0
     first_prompt = ""
+    last_prompt = ""
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
             for raw in f:
@@ -113,13 +115,15 @@ def _quick_summary(path: Path) -> Tuple[int, str]:
                 if t not in ("user", "assistant"):
                     continue
                 count += 1
-                if not first_prompt and t == "user":
+                if t == "user":
                     text = _extract_user_text(ev)
                     if text:
-                        first_prompt = text
+                        if not first_prompt:
+                            first_prompt = text
+                        last_prompt = text
     except OSError:
         pass
-    return count, first_prompt
+    return count, first_prompt, last_prompt
 
 
 def _extract_user_text(ev: Dict[str, Any]) -> str:
@@ -173,7 +177,7 @@ def find_session(prefix: str) -> Optional[SessionInfo]:
     if len(matches) != 1:
         return None
     info = matches[0]
-    info.message_count, info.first_user_prompt = _quick_summary(info.file)
+    info.message_count, info.first_user_prompt, info.latest_user_prompt = _quick_summary(info.file)
     return info
 
 

@@ -626,14 +626,16 @@ async def handle_sessions(message: discord.Message, arg: str) -> None:
     lines: List[str] = []
     for s in sessions:
         ago = _format_elapsed(now - s.mtime)
-        preview = s.first_user_prompt.replace("\n", " ")
+        # Show the most recent user prompt — what the session is currently about,
+        # not how it started.
+        preview = (s.latest_user_prompt or s.first_user_prompt).replace("\n", " ")
         if len(preview) > 70:
             preview = preview[:70] + "…"
         lines.append(
             f"`{s.short_id}` · {s.project_label} · {s.message_count} msgs · {ago} ago · _{preview or '(no user prompt)'}_"
         )
     body = (
-        f"📚 **{len(sessions)}** session(s) (use `{CONFIG['trigger_prefix']}transcript <id>` to fetch):\n"
+        f"📚 **{len(sessions)}** session(s), newest activity first (use `{CONFIG['trigger_prefix']}transcript <id>` to fetch):\n"
         + "\n".join(lines)
     )
     if len(body) > DISCORD_MSG_LIMIT:
