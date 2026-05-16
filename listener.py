@@ -193,17 +193,38 @@ def extract_prompt(message: discord.Message) -> str | None:
     return text or None
 
 
-async def run_claude(prompt: str, job_id: str) -> tuple[int, str, str]:
-    """Run `claude -p "<prompt>"` as a subprocess. Returns (returncode, stdout, stderr)."""
-    cmd = [CONFIG["claude_path"], "-p", prompt]
+async def run_claude(
+    prompt: str,
+    job_id: str,
+    *,
+    resume_id: Optional[str] = None,
+    cwd_override: Optional[str] = None,
+) -> tuple[int, str, str]:
+    """Run `claude -p "<prompt>"` as a subprocess. Returns (returncode, stdout, stderr).
+
+    When resume_id is provided, the invocation becomes
+        claude -p --resume <resume_id> "<prompt>"
+    and cwd is set to cwd_override so the resume can find the session file under
+    ~/.claude/projects/<encoded-cwd>/<id>.jsonl.
+    """
+    cmd = [CONFIG["claude_path"], "-p"]
+    if resume_id:
+        cmd += ["--resume", resume_id]
+    cmd.append(prompt)
+    cwd = cwd_override or CONFIG["working_directory"]
     env = os.environ.copy()
     # Force a stable working dir and unbuffered output so we get progressive lines.
     env["PYTHONUNBUFFERED"] = "1"
 
-    logger.info("[%s] spawn: %s (cwd=%s)", job_id, " ".join(cmd[:2]), CONFIG["working_directory"])
+    logger.info(
+        "[%s] spawn: %s%s (cwd=%s)",
+        job_id, " ".join(cmd[:2]),
+        f" --resume {resume_id[:8]}" if resume_id else "",
+        cwd,
+    )
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        cwd=CONFIG["working_directory"],
+        cwd=cwd,
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -662,6 +683,102 @@ async def handle_transcript(message: discord.Message, arg: str) -> None:
     await message.reply(header, file=file, mention_author=False)
 
 
+async def _execute_and_reply(
+    message: discord.Message,
+    prompt: str,
+    *,
+    resume_id: Optional[str] = None,
+    cwd_override: Optional[str] = None,
+    preview_override: Optional[str] = None,
+) -> None:
+    """Acquire a slot, run claude (optionally resuming a session), post the reply.
+
+    Shared between fresh sessions (handle_message) and resumed ones
+    (handle_resume) so the ack-edit pipeline + history-write logic doesn't drift.
+    """
+    job_id = uuid.uuid4().hex[:8]
+    preview = preview_override or prompt[:200]
+    logger.info("[%s] %s: %r", job_id, message.author, preview)
+
+    label_extra = f" (resume {resume_id[:8]})" if resume_id else ""
+    ack = await message.reply(
+        f"🤖 starting `{job_id}`{label_extra} — _waiting for a free slot..._",
+        mention_author=False,
+    )
+    started = time.time()
+
+    async with SEMAPHORE:
+        await ack.edit(content=f"🤖 `{job_id}`{label_extra} running... (started <t:{int(started)}:R>)")
+        ACTIVE_JOBS[job_id] = (str(message.author), preview[:80], started)
+        try:
+            returncode, stdout, stderr = await run_claude(
+                prompt, job_id, resume_id=resume_id, cwd_override=cwd_override,
+            )
+        except FileNotFoundError as e:
+            await ack.edit(content=f"❌ `{job_id}` failed: claude binary not found ({e}). Fix `claude_path` in config.")
+            logger.exception("[%s] claude binary missing", job_id)
+            return
+        except Exception as e:
+            await ack.edit(content=f"❌ `{job_id}` errored: `{type(e).__name__}: {e}`")
+            logger.exception("[%s] unexpected error", job_id)
+            return
+        finally:
+            ACTIVE_JOBS.pop(job_id, None)
+
+    elapsed = time.time() - started
+    finished_at = time.time()
+    await ack.edit(
+        content=f"🤖 `{job_id}`{label_extra} finished in {elapsed:.1f}s — see reply below.",
+    )
+    await reply_with_output(message.channel, job_id, preview, returncode, stdout, stderr)
+    logger.info("[%s] done in %.1fs | rc=%d | stdout=%d chars", job_id, elapsed, returncode, len(stdout))
+    try:
+        await asyncio.to_thread(db_insert_sync, {
+            "job_id": job_id,
+            "author": str(message.author),
+            "preview": preview[:80].replace("\n", " "),
+            "returncode": returncode,
+            "elapsed": elapsed,
+            "started_at": started,
+            "finished_at": finished_at,
+        })
+    except Exception:
+        logger.exception("[%s] failed to write history row", job_id)
+
+
+async def handle_resume(message: discord.Message, arg: str) -> None:
+    """Continue an existing Claude session with one follow-up turn.
+
+    Form: <prefix>resume <id_prefix> <message>
+    Looks up the session, then runs `claude -p --resume <id> "<message>"` in
+    the session's original cwd so claude can find the on-disk transcript.
+    """
+    parts = arg.strip().split(None, 1)
+    if len(parts) < 2:
+        await message.reply(
+            f"Usage: `{CONFIG['trigger_prefix']}resume <id_prefix> <message>`\n"
+            f"Run `{CONFIG['trigger_prefix']}sessions` to find session IDs.",
+            mention_author=False,
+        )
+        return
+    prefix, followup = parts
+    info = await asyncio.to_thread(transcripts_mod.find_session, prefix)
+    if info is None:
+        await message.reply(
+            f"❓ No session id starts with `{prefix}`, or the prefix matches more than one. "
+            f"Use a longer prefix or run `{CONFIG['trigger_prefix']}sessions`.",
+            mention_author=False,
+        )
+        return
+    await _execute_and_reply(
+        message,
+        followup,
+        resume_id=info.session_id,
+        cwd_override=info.project_dir,
+        preview_override=f"[resume {info.short_id}] {followup}",
+    )
+
+
 async def handle_message(message: discord.Message) -> None:
     prompt = extract_prompt(message)
     if not prompt:
@@ -685,10 +802,14 @@ async def handle_message(message: discord.Message) -> None:
     if cmd in ("transcript", "tx"):
         await handle_transcript(message, tail)
         return
+    if cmd == "resume":
+        await handle_resume(message, tail)
+        return
     if cmd == "help":
         await message.reply(
             "**Commands** (with prefix `" + CONFIG["trigger_prefix"] + "`)\n"
-            "• `<prompt>` — run a Claude Code session\n"
+            "• `<prompt>` — run a fresh Claude Code session\n"
+            "• `resume <id_prefix> <message>` — continue an existing session with one follow-up\n"
             "• `status` — bot-spawned + every workstation Claude session\n"
             "• `cancel [job_id|all]` — kill one or all bot-spawned sessions\n"
             "• `history [n]` — last N (default 10) bot jobs (persists in SQLite)\n"
@@ -698,50 +819,7 @@ async def handle_message(message: discord.Message) -> None:
             mention_author=False,
         )
         return
-    job_id = uuid.uuid4().hex[:8]
-    logger.info("[%s] %s: %r", job_id, message.author, prompt[:200])
-
-    ack = await message.reply(
-        f"🤖 starting `{job_id}` — _waiting for a free slot..._",
-        mention_author=False,
-    )
-    started = time.time()
-
-    async with SEMAPHORE:
-        await ack.edit(content=f"🤖 `{job_id}` running... (started <t:{int(started)}:R>)")
-        ACTIVE_JOBS[job_id] = (str(message.author), prompt[:80], started)
-        try:
-            returncode, stdout, stderr = await run_claude(prompt, job_id)
-        except FileNotFoundError as e:
-            await ack.edit(content=f"❌ `{job_id}` failed: claude binary not found ({e}). Fix `claude_path` in config.")
-            logger.exception("[%s] claude binary missing", job_id)
-            return
-        except Exception as e:
-            await ack.edit(content=f"❌ `{job_id}` errored: `{type(e).__name__}: {e}`")
-            logger.exception("[%s] unexpected error", job_id)
-            return
-        finally:
-            ACTIVE_JOBS.pop(job_id, None)
-
-    elapsed = time.time() - started
-    finished_at = time.time()
-    await ack.edit(
-        content=f"🤖 `{job_id}` finished in {elapsed:.1f}s — see reply below.",
-    )
-    await reply_with_output(message.channel, job_id, prompt, returncode, stdout, stderr)
-    logger.info("[%s] done in %.1fs | rc=%d | stdout=%d chars", job_id, elapsed, returncode, len(stdout))
-    try:
-        await asyncio.to_thread(db_insert_sync, {
-            "job_id": job_id,
-            "author": str(message.author),
-            "preview": prompt[:80].replace("\n", " "),
-            "returncode": returncode,
-            "elapsed": elapsed,
-            "started_at": started,
-            "finished_at": finished_at,
-        })
-    except Exception:
-        logger.exception("[%s] failed to write history row", job_id)
+    await _execute_and_reply(message, prompt)
 
 
 def _set_intents() -> discord.Intents:
